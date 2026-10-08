@@ -1,0 +1,12 @@
+local_settings.json
+.env
+.env.*
+__pycache__/
+*.pyc
+.venv/
+market_summary.json
+morning_brief_latest.md
+morning_context.json
+evening_review_*.md
+github_upload.zip
+.codex-check/
