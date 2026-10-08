@@ -97,57 +97,90 @@ def get_us_market_data():
     return result
 
 
-def get_japan_stop_high():
-    """
-    株探の上昇率/ストップ高テーブルから、コード・社名・市場・株価・前日比を正確に抽出
-    """
-    url = "https://kabutan.jp/warning/?mode=2_1"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+STOP_HIGH_URL = "https://s.kabutan.jp/warnings/price_limit_up/"
+
+
+def parse_japan_stop_high(html):
+    """Parse only the public price-limit-up table; never disguise errors as zero."""
+    import re
+    from datetime import datetime
+
+    soup = BeautifulSoup(html, "html.parser")
+    heading = soup.find("h1")
+    if not heading or "ストップ高銘柄" not in heading.get_text():
+        raise RuntimeError("Kabutan stop-high page title is missing")
+    stamp = re.search(
+        r"株価[：:]\s*(\d{4})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2}):(\d{2})現在",
+        soup.get_text(" ", strip=True),
+    )
+    if not stamp:
+        raise RuntimeError("Kabutan quote date is missing")
+    quote_date = datetime(*map(int, stamp.groups()[:3])).date()
+    today = datetime.strptime(today_jst(), "%Y-%m-%d").date()
+    if quote_date > today or (today - quote_date).days > 7:
+        raise RuntimeError(f"Kabutan quote date is invalid or stale: {quote_date}")
+    table = next(
+        (t for t in soup.find_all("table")
+         if t.select_one('thead a[href*="order=stock_code"]')),
+        None,
+    )
+    if table is None:
+        raise RuntimeError("Kabutan stop-high table is missing")
+    stocks = []
+    for row in table.select("tbody tr"):
+        link = row.select_one('a[href^="/stocks/"]')
+        cells = row.find_all("td", recursive=False)
+        if not link:
+            # Only an explicit no-results row can represent a legitimate empty list.
+            if re.search(r"該当.*(?:ありません|ございません)|対象.*ありません", row.get_text()):
+                continue
+            raise RuntimeError("Unrecognized Kabutan stock row")
+        code_match = re.fullmatch(r"/stocks/([0-9A-Z]{4})/", link.get("href", ""))
+        name = link.find("p")
+        labels = [s.get_text(strip=True) for s in link.find_all("span")]
+        if not code_match or name is None or len(cells) < 2 or not labels:
+            raise RuntimeError("Kabutan stock row format changed")
+        marker = labels[1] if len(labels) > 1 else ""
+        stocks.append({
+            "code": code_match.group(1),
+            "name": name.get_text(" ", strip=True),
+            "market": labels[0],
+            "price": cells[0].get_text(" ", strip=True),
+            "change": cells[1].get_text(" ", strip=True),
+            "limit_status": "current_limit_up" if marker == "Ｓ"
+                            else "limit_up_quote" if marker in ("Sｹ", "Ｓケ")
+                            else "special_buy_quote" if marker == "ケ"
+                            else "intraday_limit_up_or_quote",
+            "source_marker": marker,
+        })
+    # Do not trust the page's display-count widget (it can say 0 despite rows).
+    if not stocks and not re.search(
+        r"該当.*(?:ありません|ございません)|対象.*ありません", table.get_text()
+    ):
+        raise RuntimeError("Kabutan table is empty without an explicit no-results message")
+    if soup.select_one('a[rel="next"]'):
+        raise RuntimeError("Kabutan has additional pages; refusing an incomplete count")
+    return {
+        "stop_high_count": len(stocks),
+        "stop_high_stocks": stocks,
+        "source_url": STOP_HIGH_URL,
+        "source_date_jst": quote_date.isoformat(),
+        "source_time_jst": ":".join(stamp.groups()[3:]),
+        "data_period": "prior_session" if quote_date < today else "current_session",
+        "scope": "ストップ高銘柄（気配・一時ストップ高を含む）。掲載日のデータであり、全銘柄が終値ストップ高とは限りません。",
+        "fetch_status": "success",
     }
-    
-    stop_high_list = []
-    
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.encoding = response.apparent_encoding
-        
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, "html.parser")
-            table = soup.find("table", class_="stock_table")
-            
-            if table:
-                tbody = table.find("tbody")
-                rows = tbody.find_all("tr") if tbody else table.find_all("tr")[1:]
-                
-                for row in rows:
-                    # コード: 最初の td (class="tac")
-                    first_td = row.find("td")
-                    if not first_td:
-                        continue
-                    code = first_td.text.strip()
-                    
-                    # 社名: th タグ (scope="row" class="tal")
-                    th_name = row.find("th")
-                    name = th_name.text.strip() if th_name else ""
-                    
-                    # 全tdを取得して市場や株価を拾う
-                    tds = row.find_all("td")
-                    market = tds[1].text.strip() if len(tds) > 1 else ""
-                    price = tds[4].text.strip() if len(tds) > 4 else ""
-                    change = tds[5].text.strip() if len(tds) > 5 else ""
-                    
-                    stop_high_list.append({
-                        "code": code,
-                        "name": name,
-                        "market": market,
-                        "price": price,
-                        "change": change
-                    })
-    except Exception as e:
-        print(f"株探スクレイピングエラー: {e}")
-        
-    return stop_high_list
+
+
+def get_japan_stop_high():
+    response = requests.get(
+        STOP_HIGH_URL,
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    response.encoding = "utf-8"
+    return parse_japan_stop_high(response.text)
 
 
 def main():
@@ -159,10 +192,7 @@ def main():
     
     payload = {
         "us_market": us_data,
-        "japan_market": {
-            "stop_high_count": len(jp_data),
-            "stop_high_stocks": jp_data[:10]
-        }
+        "japan_market": jp_data
     }
     
     json_output = json.dumps(payload, ensure_ascii=False, indent=2)
