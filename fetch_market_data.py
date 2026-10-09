@@ -1,8 +1,9 @@
 import json
+import math
 import requests
 from bs4 import BeautifulSoup
 import yfinance as yf
-from settings import BASE_DIR, get_setting, require_settings, today_jst
+from settings import BASE_DIR, get_setting, require_settings, today_jst, target_date_jst, now_jst
 
 DIFY_API_KEY = get_setting("DIFY_API_KEY")
 DIFY_API_URL = "https://api.dify.ai/v1/chat-messages"
@@ -25,7 +26,13 @@ def run_dify_morning_brief(market_data_dict):
         "inputs": {
             "market_data": json.dumps(market_data_dict, ensure_ascii=False, indent=2)
         },
-        "query": "ブリーフを作成して",
+        "query": (
+            f"対象日 {target_date_jst()} のブリーフを作成してください。"
+            "japan_market.source_date_jst と source_time_jst を明記し、"
+            "data_period が current_session なら当日の途中経過、prior_session なら過去の掲載日として扱ってください。"
+            "当日データを前日と表現しないでください。気配・一時ストップ高を終値ストップ高と断定しないでください。"
+            "取得時刻が寄り付き後なら遅延したブリーフとして扱い、既に起きた値動きを事前予測として扱わないでください。"
+        ),
         "response_mode": "blocking",
         "user": "master_trader"
     }
@@ -46,6 +53,15 @@ def run_dify_morning_brief(market_data_dict):
         brief_text = result.get("answer", "")
         if not isinstance(brief_text, str) or not brief_text.strip():
             raise RuntimeError("Dify returned an empty answer")
+        jp = market_data_dict["japan_market"]
+        brief_text = (
+            f"対象日（JST）: {target_date_jst()}\n"
+            f"取得日時（JST）: {market_data_dict['fetched_at_jst']}\n"
+            f"国内データ掲載日時（JST）: {jp['source_date_jst']} {jp['source_time_jst']}\n"
+            f"国内データ区分: {jp['data_period']}\n"
+            "※取得時刻が寄り付き後の場合は、寄り付き前の予測には使用できません。\n\n"
+            + brief_text
+        )
         print("\n=== 朝の投資戦略ブリーフ（自動生成完了）===\n")
         print(brief_text)
 
@@ -77,23 +93,22 @@ def get_us_market_data():
             ticker = yf.Ticker(symbol)
             hist = ticker.history(period="5d")
             
+            if len(hist) < 2:
+                raise RuntimeError(f"{symbol}: two sessions are required")
             if len(hist) >= 2:
                 latest_close = float(hist["Close"].iloc[-1])
                 prev_close = float(hist["Close"].iloc[-2])
+                if not all(math.isfinite(v) for v in (latest_close, prev_close)) or prev_close <= 0:
+                    raise RuntimeError(f"{symbol}: invalid prices")
                 change_pct = round(((latest_close - prev_close) / prev_close) * 100, 2)
                 
                 result[name] = {
                     "latest": round(latest_close, 2),
                     "change_pct": change_pct
                 }
-            elif len(hist) == 1:
-                result[name] = {
-                    "latest": round(float(hist["Close"].iloc[-1]), 2),
-                    "change_pct": 0.0
-                }
         except Exception as e:
-            result[name] = {"error": str(e)}
-            
+            raise RuntimeError(f"Required market data unavailable: {symbol}") from e
+
     return result
 
 
@@ -116,7 +131,7 @@ def parse_japan_stop_high(html):
     if not stamp:
         raise RuntimeError("Kabutan quote date is missing")
     quote_date = datetime(*map(int, stamp.groups()[:3])).date()
-    today = datetime.strptime(today_jst(), "%Y-%m-%d").date()
+    today = datetime.strptime(target_date_jst(), "%Y-%m-%d").date()
     if quote_date > today or (today - quote_date).days > 7:
         raise RuntimeError(f"Kabutan quote date is invalid or stale: {quote_date}")
     table = next(
@@ -180,17 +195,36 @@ def get_japan_stop_high():
     )
     response.raise_for_status()
     response.encoding = "utf-8"
-    return parse_japan_stop_high(response.text)
+    data = parse_japan_stop_high(response.text)
+    if data["data_period"] == "prior_session":
+        # Use actual index sessions rather than guessing weekdays/JPX holidays.
+        from datetime import datetime, timedelta
+        target = datetime.strptime(target_date_jst(), "%Y-%m-%d").date()
+        sessions = yf.Ticker("^N225").history(
+            start=(target - timedelta(days=30)).isoformat(), end=target.isoformat()
+        )
+        if sessions.empty:
+            raise RuntimeError("Cannot verify the prior Japan trading session")
+        dates = sessions.index
+        if dates.tz is not None:
+            dates = dates.tz_convert("Asia/Tokyo")
+        if dates[-1].date().isoformat() != data["source_date_jst"]:
+            raise RuntimeError(f"Kabutan date is not the prior trading session: {data['source_date_jst']}")
+    return data
 
 
 def main():
     require_settings("DIFY_API_KEY")
     print("データ収集中...")
     
+    if target_date_jst() != today_jst():
+        raise RuntimeError("Historical morning briefs cannot be recreated from live data")
     us_data = get_us_market_data()
     jp_data = get_japan_stop_high()
     
     payload = {
+        "target_date_jst": target_date_jst(),
+        "fetched_at_jst": now_jst(),
         "us_market": us_data,
         "japan_market": jp_data
     }
@@ -204,7 +238,7 @@ def main():
     print("\n-> 'market_summary.json' として保存しました。")
     run_dify_morning_brief(payload)
     (BASE_DIR / "morning_context.json").write_text(
-        json.dumps({"date_jst": today_jst()}, indent=2), encoding="utf-8"
+        json.dumps({"date_jst": target_date_jst(), "generated_at_jst": now_jst()}, indent=2), encoding="utf-8"
     )
 
 if __name__ == "__main__":

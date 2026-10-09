@@ -13,6 +13,10 @@ on:
         type: choice
         options: [morning, evening]
         default: morning
+      target_date:
+        description: 'Target date JST (YYYY-MM-DD; blank uses run creation date)'
+        type: string
+        default: ''
       notes:
         description: Optional evening notes
         type: string
@@ -42,26 +46,27 @@ jobs:
           python-version: '3.14'
           cache: pip
       - run: python -m pip install -r requirements.txt
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
       - name: Select mode and Japan date
         id: context
         env:
           REQUESTED_MODE: ${{ inputs.mode }}
           SCHEDULE: ${{ github.event.schedule }}
-        run: |
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            mode="$REQUESTED_MODE"
-          elif [ "$SCHEDULE" = "30 22 * * 0-4" ]; then
-            mode=morning
-          else
-            mode=evening
-          fi
-          echo "mode=$mode" >> "$GITHUB_OUTPUT"
-          echo "date=$(date +%F)" >> "$GITHUB_OUTPUT"
+          REQUESTED_DATE: ${{ inputs.target_date }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python .github/scripts/select_context.py
       - name: Generate morning brief
+        id: brief
         if: steps.context.outputs.mode == 'morning'
         env:
           DIFY_API_KEY: ${{ secrets.DIFY_API_KEY }}
-        run: python fetch_market_data.py
+        run: |
+          set -o pipefail
+          python fetch_market_data.py 2>&1 | tee morning-process.log
+          test -s market_summary.json
+          test -s morning_brief_latest.md
+          test -s morning_context.json
       - name: Save morning context
         if: steps.context.outputs.mode == 'morning'
         uses: actions/upload-artifact@v4
@@ -78,7 +83,9 @@ jobs:
         id: morning
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python .github/scripts/find_morning_artifact.py
+        run: |
+          set -o pipefail
+          python .github/scripts/find_morning_artifact.py 2>&1 | tee morning-lookup-process.log
       - name: Restore morning context
         if: steps.context.outputs.mode == 'evening'
         uses: actions/download-artifact@v5
@@ -87,18 +94,49 @@ jobs:
           github-token: ${{ github.token }}
           run-id: ${{ steps.morning.outputs.run_id }}
       - name: Generate review and upload knowledge
+        id: review
         if: steps.context.outputs.mode == 'evening'
         env:
           DIFY_API_KEY: ${{ secrets.DIFY_API_KEY }}
           DATASET_API_KEY: ${{ secrets.DATASET_API_KEY }}
           DATASET_ID: ${{ secrets.DATASET_ID }}
           REVIEW_NOTES: ${{ inputs.notes }}
-        run: python verify_and_learn.py --non-interactive --notes "$REVIEW_NOTES"
+        run: |
+          set -o pipefail
+          python verify_and_learn.py --non-interactive --notes "$REVIEW_NOTES" 2>&1 | tee evening-process.log
       - name: Save evening report
-        if: always() && steps.context.outputs.mode == 'evening'
+        if: always() && steps.context.outputs.mode == 'evening' && steps.review.outcome != 'skipped'
         uses: actions/upload-artifact@v4
         with:
           name: evening-${{ steps.context.outputs.date }}
-          path: evening_review_*.md
-          if-no-files-found: ignore
+          path: evening_review_${{ steps.context.outputs.date }}.md
+          if-no-files-found: error
+          retention-days: 30
+      - name: Write failure diagnostics
+        if: failure()
+        env:
+          MODE: ${{ steps.context.outputs.mode }}
+          TARGET: ${{ steps.context.outputs.date }}
+          MORNING_LOOKUP: ${{ steps.morning.outcome }}
+          REVIEW: ${{ steps.review.outcome }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          from settings import now_jst
+          data = {key: os.environ.get(key, '') for key in
+                  ('MODE', 'TARGET', 'MORNING_LOOKUP', 'REVIEW', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT')}
+          data['recorded_at_jst'] = now_jst()
+          data['note'] = 'Workflow failed. Check the failed step and process logs; no successful review is implied.'
+          Path('failure-diagnostics.json').write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+      - name: Save failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            failure-diagnostics.json
+            *-process.log
+          if-no-files-found: error
           retention-days: 30

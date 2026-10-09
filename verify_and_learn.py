@@ -1,11 +1,12 @@
 import os
+import math
 import argparse
 import sys
 import json
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 import yfinance as yf
-from settings import BASE_DIR, get_setting, require_settings, today_jst
+from settings import BASE_DIR, get_setting, require_settings, target_date_jst, now_jst, JST
 
 # ==========================================
 # API 設定
@@ -37,24 +38,50 @@ def load_morning_context():
     return brief_text, summary_data
 
 
+def history_for_target(ticker):
+    target = datetime.strptime(target_date_jst(), "%Y-%m-%d").date()
+    hist = ticker.history(start=(target - timedelta(days=30)).isoformat(),
+                          end=(target + timedelta(days=1)).isoformat())
+    if hist.empty:
+        raise RuntimeError(f"No price history for {target}")
+    dates = hist.index
+    if dates.tz is not None:
+        dates = dates.tz_convert("Asia/Tokyo")
+    hist = hist[dates.date <= target]
+    dates = hist.index
+    if dates.tz is not None:
+        dates = dates.tz_convert("Asia/Tokyo")
+    if len(hist) < 2 or dates[-1].date() != target:
+        raise RuntimeError(f"Target session {target} is missing")
+    values = [float(hist[col].iloc[-1]) for col in ("Open", "High", "Low", "Close")]
+    values.append(float(hist["Close"].iloc[-2]))
+    if not all(math.isfinite(v) and v > 0 for v in values):
+        raise RuntimeError("Invalid price data")
+    return hist
+
+
 def fetch_evening_actual_results(summary_data):
     """
     夕方の日経平均および朝注目銘柄の引け値・騰落を自動取得
     """
     print("\n[1/3] 夕方の市場実績データを収集中...")
-    results = {}
+    target = datetime.strptime(target_date_jst(), "%Y-%m-%d").date()
+    now = datetime.now(JST)
+    if target > now.date() or (target == now.date() and (now.hour, now.minute) < (15, 30)):
+        raise RuntimeError("Target session has not closed yet")
+    results = {"target_date_jst": target_date_jst(), "fetched_at_jst": now_jst()}
 
     # 日経平均（^N225）
     try:
         n225 = yf.Ticker("^N225")
-        h = n225.history(period="2d")
+        h = history_for_target(n225)
         if len(h) >= 2:
             c = float(h["Close"].iloc[-1])
             prev = float(h["Close"].iloc[-2])
             pct = round(((c - prev) / prev) * 100, 2)
             results["nikkei225"] = {"close": round(c, 2), "change_pct": pct}
     except Exception as e:
-        results["nikkei225"] = {"error": str(e)}
+        raise RuntimeError("Required Nikkei target-session data unavailable") from e
 
     # 朝の注目銘柄
     stocks = summary_data.get("japan_market", {}).get("stop_high_stocks", [])[:5]
@@ -76,7 +103,7 @@ def fetch_evening_actual_results(summary_data):
         ticker_sym = f"{code}.T"
         try:
             t = yf.Ticker(ticker_sym)
-            hist = t.history(period="2d")
+            hist = history_for_target(t)
             if len(hist) >= 2:
                 close = float(hist["Close"].iloc[-1])
                 prev = float(hist["Close"].iloc[-2])
@@ -97,6 +124,9 @@ def fetch_evening_actual_results(summary_data):
         except Exception as e:
             stock_results.append({"code": code, "name": name, "error": str(e)})
 
+    failures = [s for s in stock_results if "error" in s and s.get("market", "東").startswith("東")]
+    if failures:
+        raise RuntimeError(f"Target-session stock data unavailable: {failures}")
     results["monitored_stocks"] = stock_results
     return results
 
@@ -112,7 +142,8 @@ def generate_review_with_llm(brief_text, actual_data, manual_notes, summary_data
     }
 
     verification_query = f"""
-本日の大引け後の検証・教訓レポートを作成してください。
+対象日 {target_date_jst()} の大引け後の検証・教訓レポートを作成してください。
+朝ブリーフの取得時刻を確認し、寄り付き後のデータを寄り付き前の予測として評価しないでください。
 
 ### 朝の投資戦略ブリーフ（前提）
 {brief_text}
@@ -129,7 +160,7 @@ def generate_review_with_llm(brief_text, actual_data, manual_notes, summary_data
 取得エラーのある銘柄は検証対象外と明記し、価格や値動きを推測しないでください。
 日足の始値・高値・安値・終値だけでは高値や安値を付けた順序は分かりません。寄り天や午後の値動きを断定しないでください。
 
-# 相場答え合わせと教訓: {today_jst()}
+# 相場答え合わせと教訓: {target_date_jst()}
 
 ## 1. 朝の想定シナリオと実際の結果（答え合わせ）
 - 指数・マクロの動向と乖離
@@ -203,10 +234,9 @@ def main():
     require_settings("DATASET_API_KEY", "DATASET_ID")
     if not DIFY_APP_API_KEY:
         raise RuntimeError("DIFY_API_KEY or DIFY_APP_API_KEY is required")
-    if args.non_interactive:
-        metadata = json.loads((BASE_DIR / "morning_context.json").read_text(encoding="utf-8"))
-        if metadata.get("date_jst") != today_jst():
-            raise RuntimeError("Today's morning data is required")
+    metadata = json.loads((BASE_DIR / "morning_context.json").read_text(encoding="utf-8"))
+    if metadata.get("date_jst") != target_date_jst():
+        raise RuntimeError("Morning data for the target date is required")
     print("=== [夕方] 相場答え合わせ＆ナレッジ自動蓄積 ===")
     brief_text, summary_data = load_morning_context()
 
@@ -215,6 +245,8 @@ def main():
         raise RuntimeError("morning_brief_latest.md is missing or empty")
     if not summary_data:
         raise RuntimeError("market_summary.json is missing or empty")
+    if summary_data.get("target_date_jst", target_date_jst()) != target_date_jst():
+        raise RuntimeError("Market summary target date does not match morning metadata")
 
     # 1. 夕方の実績を自動取得
     actual_data = fetch_evening_actual_results(summary_data)
@@ -227,11 +259,12 @@ def main():
     # 3. LLMで自動答え合わせレポート生成
     reviewed_doc = generate_review_with_llm(brief_text, actual_data, notes, summary_data)
 
-    today_str = today_jst()
+    today_str = target_date_jst()
 
-    if not reviewed_doc:
+    if not isinstance(reviewed_doc, str) or not reviewed_doc.strip():
         raise RuntimeError("AI review generation failed; knowledge upload stopped")
 
+    reviewed_doc = f"対象日（JST）: {today_str}\n生成日時（JST）: {now_jst()}\n\n" + reviewed_doc
     print("\n" + "=" * 50)
     print("📝 生成された答え合わせ＆教訓レポート")
     print("=" * 50)

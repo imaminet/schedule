@@ -17,6 +17,17 @@ def today_jst():
     return datetime.now(JST).strftime("%Y-%m-%d")
 
 
+def target_date_jst():
+    value = os.environ.get("TARGET_DATE_JST", "").strip() or today_jst()
+    if datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d") != value:
+        raise ValueError("TARGET_DATE_JST must be YYYY-MM-DD")
+    return value
+
+
+def now_jst():
+    return datetime.now(JST).isoformat(timespec="seconds")
+
+
 def require_settings(*names):
     missing = [name for name in names if not get_setting(name)]
     if missing:
