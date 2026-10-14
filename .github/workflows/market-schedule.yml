@@ -1,11 +1,6 @@
 name: Market brief and review
 
 on:
-  schedule:
-    # JST weekdays 07:30 (UTC previous day 22:30).
-    - cron: '30 22 * * 0-4'
-    # JST weekdays 17:00.
-    - cron: '0 8 * * 1-5'
   workflow_dispatch:
     inputs:
       mode:
